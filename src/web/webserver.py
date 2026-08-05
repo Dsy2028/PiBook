@@ -6,18 +6,74 @@ Provides web interface for:
 - Book selection
 """
 
-from flask import Flask, render_template, request, jsonify, send_from_directory, redirect, url_for
+from flask import Flask, render_template, request, jsonify, send_from_directory, redirect, url_for, Response
 import os
 import logging
 import json
 from werkzeug.utils import secure_filename
 from pathlib import Path
+import socket
+import requests
+import time
+import sys
 
+CALIBRE_URL = "http://192.168.0.211:8080"
+
+
+BASE_DIR   = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+CACHE_PATH = os.path.join(BASE_DIR, 'cache', 'books.json')
+DOWNLOADED_BOOKS_PATH = os.path.join(BASE_DIR, 'cache', 'downloaded')
+
+MAX_RETRIES = 3
+RETRY_DELAY = 30
+
+mode = "offline"
+
+""" def  setCachePath():
+    if sys.platform == 'win32':
+        # Windows dev path — relative to project root
+        BASE_DIR   = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        CACHE_PATH = os.path.join(BASE_DIR, 'cache', 'books.json')
+    else:
+        # Production Pi path
+        CACHE_PATH = '/home/pi/PiBook/cache/books.json' """
+
+def startup():
+    global mode
+    
+    try:
+        socket.setdefaulttimeout(2)
+        socket.create_connection((CALIBRE_URL.split("//")[1].split(":")[0], 8080))
+    except OSError:
+        mode = "offline"
+        return
+
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            r = requests.get(f"{CALIBRE_URL}/ajax/books", timeout=5)
+            
+            if r.ok:
+                print(r._content)
+                os.makedirs(os.path.dirname(CACHE_PATH), exist_ok=True)
+                with open(CACHE_PATH, "w") as f:
+                    json.dump(r.json(), f)
+                mode = "online"
+                return
+        except Exception:
+            pass
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_DELAY)
+
+    mode = "offline"  # all retries failed
+  
 
 class PiBookWebServer:
     """
     Web server for remote control and file management
     """
+    
+
 
     def __init__(self, books_dir: str, app_instance, port: int = 5000, version: str = "v1.0"):
         """
@@ -41,14 +97,19 @@ class PiBookWebServer:
         self.flask_app = Flask(__name__, template_folder=template_dir, static_folder=static_dir)
         self.flask_app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
 
-        # Initialize To-Do module
-        from apps.todo import TodoManager, todo_bp, init_routes
-        self.todo_manager = TodoManager(app_instance=app_instance)
-        init_routes(self.todo_manager)
-        self.flask_app.register_blueprint(todo_bp)
-        self.logger.info("Registered To-Do Blueprint")
 
         self._setup_routes()
+    def get_downloaded_ids(self):
+        downloaded_ids = []
+        if os.path.exists(DOWNLOADED_BOOKS_PATH):
+            for filename in os.listdir(DOWNLOADED_BOOKS_PATH):
+                if filename.endswith('.epub'):
+                    book_id = filename.split('_')[0]
+                    print(book_id, flush=True)
+                    if book_id.isdigit():
+                        downloaded_ids.append(book_id)
+        return downloaded_ids
+
 
     def _setup_routes(self):
         """Setup Flask routes"""
@@ -58,6 +119,111 @@ class PiBookWebServer:
             """Main page with file manager and controls"""
             settings_data = self._load_settings('settings.json')
             return render_template('base.html', books=self._get_books(), settings=settings_data, version=self.version)
+        
+        
+        @self.flask_app.route('/api/status')
+        def get_status():
+          return jsonify({ "mode": mode })  # "online" or "offline"
+
+        @self.flask_app.route('/api/books')
+        def get_books():
+            """Serve cached Calibre book catalog"""
+            try:
+                with open(CACHE_PATH) as f:
+                    return jsonify(json.load(f))
+            except FileNotFoundError:
+                return jsonify({}), 404
+
+        @self.flask_app.route('/api/books/downloaded')
+        def get_downloaded():
+            return jsonify(self.get_downloaded_ids())
+
+        @self.flask_app.route('/api/books/download', methods=['POST'])
+        def download_books():
+
+            data     = request.get_json()
+            print(data)
+            book_ids = data.get('book_ids', [])
+            print(book_ids)
+            
+            # Load the cached book catalog so we know each book's download URL
+            try:
+                with open(CACHE_PATH) as f:
+                    catalog = json.load(f)
+            except FileNotFoundError:
+                return jsonify({'error': 'Book catalog not found'}), 404
+
+            downloaded = []
+            failed     = []
+
+            for book_id in book_ids:
+                book = catalog.get(str(book_id))
+                if not book:
+                    failed.append(book_id)
+                    continue
+
+                # Get the epub download path from the catalog
+                epub_path = book.get('main_format', {}).get('epub')
+                print(epub_path)
+                if not epub_path:
+                    failed.append(book_id)
+                    continue
+
+                # Build the full URL and fetch from Calibre
+                url = f"{CALIBRE_URL}{epub_path}"
+                try:
+                    r = requests.get(url, timeout=30)
+                    if r.ok:
+                        # Use book id + title as filename to avoid collisions
+                        title    = book.get('title', f'book_{book_id}')
+                        safe     = secure_filename(f"{book_id}_{title}.epub")
+                        os.makedirs(DOWNLOADED_BOOKS_PATH, exist_ok=True)
+                        filepath = os.path.join(DOWNLOADED_BOOKS_PATH, safe)
+                        with open(filepath, 'wb') as f:
+                            f.write(r.content)
+                        downloaded.append(book_id)
+                    else:
+                        failed.append(book_id)
+                except Exception as e:
+                    self.logger.error(f"Failed to download book {book_id}: {e}")
+                    failed.append(book_id)
+
+            return jsonify({
+                'status':     'ok',
+                'downloaded': downloaded,
+                'failed':     failed,
+            })
+
+        @self.flask_app.route('/api/books/delete', methods=['POST'])
+        def delete_books():
+            data     = request.get_json()
+            book_ids = data.get('book_ids', [])
+            deleted  = []
+            failed   = []
+
+            for book_id in book_ids:
+                # Find the file matching this id prefix
+                matched = [
+                    f for f in os.listdir(DOWNLOADED_BOOKS_PATH)
+                    if f.startswith(f"{book_id}_") and f.endswith('.epub')
+                ]
+                if not matched:
+                    failed.append(book_id)
+                    continue
+
+                try:
+                    os.remove(os.path.join(DOWNLOADED_BOOKS_PATH, matched[0]))
+                    deleted.append(book_id)
+                except Exception as e:
+                    self.logger.error(f"Failed to delete book {book_id}: {e}")
+                    failed.append(book_id)
+
+            # Return updated downloaded ids after deletion
+            return jsonify({
+                'deleted':      deleted,
+                'failed':       failed,
+                'downloaded':   self.get_downloaded_ids(),
+            })
 
         @self.flask_app.route('/upload', methods=['POST'])
         def upload():
@@ -87,21 +253,38 @@ class PiBookWebServer:
             self.logger.info(f"Uploaded {uploaded_count} book(s)")
             return jsonify({'success': True, 'count': uploaded_count})
 
-        @self.flask_app.route('/delete/<filename>')
-        def delete(filename):
-            """Delete EPUB file"""
-            filepath = os.path.join(self.books_dir, secure_filename(filename))
-            if os.path.exists(filepath) and filepath.endswith('.epub'):
-                os.remove(filepath)
-                self.logger.info(f"Deleted: {filename}")
+     
 
-                # Reload library screen to show updated book list
-                self.app_instance.library_screen.load_books(self.books_dir)
-                # Refresh the display if on library screen
-                if self.app_instance.navigation.current_screen.value == 'library':
-                    self.app_instance._render_current_screen()
 
-            return redirect(url_for('index'))
+        @self.flask_app.route('/api/books/stream/<book_id>')
+        def stream_book(book_id):
+            if mode == "offline":
+                # Find the downloaded file and serve it
+                for filename in os.listdir(self.books_dir):
+                    if filename.startswith(f"{book_id}_"):
+                        return send_from_directory(self.books_dir, filename)
+                return jsonify({'error': 'Book not downloaded'}), 404
+
+            # Online — proxy directly from Calibre
+            try:
+                with open(CACHE_PATH) as f:
+                    catalog = json.load(f)
+                book     = catalog.get(str(book_id))
+                epub_url = book.get('main_format', {}).get('epub')
+                r = requests.get(
+                    f"{CALIBRE_URL}{epub_url}",
+                    stream=True,
+                    timeout=10
+                )
+                return Response(
+                    r.iter_content(chunk_size=8192),
+                    content_type='application/epub+zip',
+                    headers={
+                        'Content-Disposition': f'inline; filename="{book_id}.epub"'
+                    }
+                )
+            except Exception as e:
+                return jsonify({'error': str(e)}), 500
 
         @self.flask_app.route('/api/progress/list')
         def list_progress():
@@ -223,97 +406,7 @@ class PiBookWebServer:
             except Exception as e:
                 return jsonify({'error': str(e)}), 500
 
-        # IP Scanner API Routes
-        @self.flask_app.route('/api/ipscanner/status')
-        def ipscanner_status():
-            """Get current IP scanner status"""
-            try:
-                from src.apps.ipscanner.screen import get_ip_address
 
-                scanner = self.app_instance.ip_scanner_screen
-                return jsonify({
-                    'scanning': scanner.scanning,
-                    'progress': scanner.scan_progress,
-                    'devices': scanner.devices,
-                    'local_ip': get_ip_address()
-                })
-            except Exception as e:
-                self.logger.error(f"IP scanner status error: {e}")
-                return jsonify({'error': str(e)}), 500
-
-        @self.flask_app.route('/api/ipscanner/scan', methods=['POST'])
-        def ipscanner_start():
-            """Start IP scanner"""
-            try:
-                scanner = self.app_instance.ip_scanner_screen
-
-                if scanner.scanning:
-                    return jsonify({'status': 'already_scanning'})
-
-                scanner.start_scan()
-                return jsonify({'status': 'started'})
-            except Exception as e:
-                self.logger.error(f"IP scanner start error: {e}")
-                return jsonify({'error': str(e)}), 500
-
-        # Klipper Printer Discovery API
-        # Store discovered printers
-        self.klipper_printers = []
-        self.klipper_scanning = False
-
-        @self.flask_app.route('/api/klipper/printers')
-        def klipper_printers():
-            """Get list of discovered Klipper printers"""
-            return jsonify({
-                'printers': self.klipper_printers,
-                'scanning': self.klipper_scanning
-            })
-
-        @self.flask_app.route('/api/klipper/scan', methods=['POST'])
-        def klipper_scan():
-            """Scan network for Klipper printers"""
-            import threading
-
-            if self.klipper_scanning:
-                return jsonify({'status': 'scanning'})
-
-            def scan_for_klipper():
-                self.klipper_scanning = True
-                self.klipper_printers = []
-
-                try:
-                    # Get devices from IP scanner
-                    scanner = self.app_instance.ip_scanner_screen
-
-                    # If no devices scanned yet, trigger a scan
-                    if not scanner.devices and not scanner.scanning:
-                        scanner.start_scan()
-                        # Wait for scan to complete
-                        import time
-                        while scanner.scanning:
-                            time.sleep(0.5)
-
-                    # Check each device for Klipper (port 80 and 7125)
-                    for device in scanner.devices:
-                        ip = device['ip']
-
-                        # Check if port 7125 (Moonraker API) is open
-                        if self._check_port(ip, 7125):
-                            printer_info = self._get_klipper_info(ip, device.get('hostname', ''))
-                            if printer_info:
-                                self.klipper_printers.append(printer_info)
-
-                    self.logger.info(f"Found {len(self.klipper_printers)} Klipper printers")
-
-                except Exception as e:
-                    self.logger.error(f"Klipper scan error: {e}")
-                finally:
-                    self.klipper_scanning = False
-
-            thread = threading.Thread(target=scan_for_klipper, daemon=True)
-            thread.start()
-
-            return jsonify({'status': 'started'})
 
         @self.flask_app.route('/reboot')
         def reboot():
@@ -448,65 +541,6 @@ class PiBookWebServer:
                 self.logger.error(f"Failed to save settings: {e}")
                 return jsonify({'error': str(e)}), 400
 
-        @self.flask_app.route('/terminal/execute', methods=['POST'])
-        def terminal_execute():
-            """Execute a terminal command"""
-            try:
-                command = request.json.get('command', '').strip()
-                
-                if not command:
-                    return jsonify({'error': 'No command provided'}), 400
-                
-                # Log the command
-                self.logger.info(f"Terminal command: {command}")
-                
-                # Intercept 'git pull' to use safe update script
-                if command.strip() == 'git pull':
-                    command = 'bash /home/pi/PiBook/scripts/safe_update.sh'
-                    self.logger.info("Intercepted git pull, using safe update script")
-                
-                # We will use text/event-stream for SSE to easily stream from Python to JS
-                import subprocess
-                from flask import Response
-                import json
-                
-                def generate():
-                    try:
-                        # Use Popen to stream output
-                        process = subprocess.Popen(
-                            command,
-                            shell=True,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,  # Combine stderr and stdout
-                            text=True,
-                            cwd='/home/pi/PiBook',
-                            bufsize=1  # Line buffered
-                        )
-                        
-                        # Read output line by line as it is generated
-                        for line in iter(process.stdout.readline, ''):
-                            if line:
-                                # Send as SSE event data
-                                yield f"data: {json.dumps({'stdout': line})}\n\n"
-                                
-                        # Wait for process to finish and get return code
-                        process.stdout.close()
-                        returncode = process.wait()
-                        
-                        # Send final message with return code
-                        yield f"data: {json.dumps({'returncode': returncode})}\n\n"
-                        
-                    except Exception as e:
-                        self.logger.error(f"Error during command execution: {e}")
-                        yield f"data: {json.dumps({'error': str(e)})}\n\n"
-
-                return Response(generate(), mimetype='text/event-stream')
-
-            except subprocess.TimeoutExpired:
-                return jsonify({'error': 'Command timed out (30s limit)'}), 408
-            except Exception as e:
-                self.logger.error(f"Terminal command failed: {e}")
-                return jsonify({'error': str(e)}), 500
 
         # Log Viewing APIs
         @self.flask_app.route('/api/logs/app')
@@ -568,260 +602,7 @@ class PiBookWebServer:
                 self.logger.error(f"Terminal command failed: {e}")
                 return jsonify({'error': str(e)}), 500
 
-        # Bluetooth Management APIs
-        @self.flask_app.route('/api/bluetooth/status')
-        def bluetooth_status():
-            """Get Bluetooth status and paired devices"""
-            try:
-                import subprocess
-                
-                # Check if Bluetooth is powered on using rfkill (much faster than bluetoothctl)
-                result = subprocess.run(['rfkill', 'list', 'bluetooth'], capture_output=True, text=True, timeout=2)
-                # Bluetooth is on if it's not soft-blocked (hard block is physical switch)
-                powered = 'Soft blocked: no' in result.stdout
-                self.logger.debug(f"Bluetooth status check: powered={powered}, rfkill output: {result.stdout[:100]}")
-                
-                # Get paired devices using helper script for consistency
-                result = subprocess.run(['sudo', '/home/pi/PiBook/scripts/bluetooth_helper.sh', 'paired_devices'],
-                                      capture_output=True, text=True, timeout=10)
-                paired_devices = []
-                for line in result.stdout.strip().split('\n'):
-                    if line.startswith('Device '):
-                        parts = line.split(' ', 2)
-                        if len(parts) >= 3:
-                            paired_devices.append({'mac': parts[1], 'name': parts[2]})
-
-                self.logger.debug(f"Paired devices raw output: {result.stdout}")
-                
-                
-                return jsonify({'powered': powered, 'paired_devices': paired_devices})
-            except Exception as e:
-                self.logger.error(f"Bluetooth status check failed: {e}")
-                return jsonify({'error': str(e)}), 500
-
-        @self.flask_app.route('/api/bluetooth/power', methods=['POST'])
-        def bluetooth_power():
-            """Toggle Bluetooth power"""
-            try:
-                import subprocess
-                data = request.get_json()
-                power_on = data.get('power', False)
-                action = 'power_on' if power_on else 'power_off'
-                
-                result = subprocess.run(['sudo', '/home/pi/PiBook/scripts/bluetooth_helper.sh', action], 
-                                      capture_output=True, text=True, timeout=10)
-                
-                if result.returncode == 0:
-                    return jsonify({'success': True, 'powered': power_on})
-                else:
-                    return jsonify({'error': result.stderr}), 500
-            except Exception as e:
-                self.logger.error(f"Bluetooth power toggle failed: {e}")
-                return jsonify({'error': str(e)}), 500
-
-        @self.flask_app.route('/api/bluetooth/scan', methods=['POST'])
-        def bluetooth_scan():
-            """Start/stop Bluetooth scanning"""
-            try:
-                import subprocess
-                data = request.get_json()
-                scan_on = data.get('scan', False)
-                action = 'scan_on' if scan_on else 'scan_off'
-                
-                result = subprocess.run(['sudo', '/home/pi/PiBook/scripts/bluetooth_helper.sh', action], 
-                                      capture_output=True, text=True, timeout=10)
-                
-                return jsonify({'success': True, 'scanning': scan_on})
-            except Exception as e:
-                self.logger.error(f"Bluetooth scan toggle failed: {e}")
-                return jsonify({'error': str(e)}), 500
-
-        @self.flask_app.route('/api/bluetooth/devices')
-        def bluetooth_devices():
-            """Get discovered Bluetooth devices"""
-            try:
-                import subprocess
-                devices = []
-                seen_macs = set()
-
-                # Get all known devices using helper script (includes recently discovered ones)
-                result = subprocess.run(['sudo', '/home/pi/PiBook/scripts/bluetooth_helper.sh', 'devices'],
-                                      capture_output=True, text=True, timeout=10)
-                for line in result.stdout.strip().split('\n'):
-                    if line.startswith('Device '):
-                        parts = line.split(' ', 2)
-                        if len(parts) >= 2:
-                            mac = parts[1]
-                            name = parts[2] if len(parts) >= 3 else mac
-                            if mac not in seen_macs:
-                                seen_macs.add(mac)
-                                devices.append({'mac': mac, 'name': name})
-
-                # Also get paired devices to mark them
-                paired_result = subprocess.run(['sudo', '/home/pi/PiBook/scripts/bluetooth_helper.sh', 'paired_devices'],
-                                             capture_output=True, text=True, timeout=10)
-                paired_macs = set()
-                for line in paired_result.stdout.strip().split('\n'):
-                    if line.startswith('Device '):
-                        parts = line.split(' ', 2)
-                        if len(parts) >= 2:
-                            paired_macs.add(parts[1])
-
-                # Mark paired devices
-                for device in devices:
-                    device['paired'] = device['mac'] in paired_macs
-
-                return jsonify({'devices': devices})
-            except Exception as e:
-                self.logger.error(f"Bluetooth device list failed: {e}")
-                return jsonify({'error': str(e)}), 500
-
-        @self.flask_app.route('/api/bluetooth/pair', methods=['POST'])
-        def bluetooth_pair():
-            """Pair with a Bluetooth device"""
-            try:
-                import subprocess
-                import threading
-                import time
-                data = request.get_json()
-                mac = data.get('mac')
-                pin = data.get('pin', '')
-
-                if not mac:
-                    return jsonify({'error': 'MAC address required'}), 400
-
-                # For PIN-based pairing, use synchronous call
-                if pin:
-                    result = subprocess.run(['sudo', '/home/pi/PiBook/scripts/bluetooth_helper.sh', 'pair', mac, pin],
-                                          capture_output=True, text=True, timeout=60)
-                    if result.returncode == 0 or 'successful' in result.stdout.lower():
-                        return jsonify({'success': True, 'status': 'paired'})
-                    else:
-                        return jsonify({'error': result.stderr or result.stdout}), 500
-
-                # For passkey-based pairing (keyboards), start process and read output incrementally
-                # to capture passkey early
-                process = subprocess.Popen(
-                    ['sudo', '/home/pi/PiBook/scripts/bluetooth_helper.sh', 'pair', mac],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True
-                )
-
-                # Read output with timeout, looking for passkey
-                import select
-                import re
-                output_lines = []
-                passkey = None
-                start_time = time.time()
-
-                # Wait up to 15 seconds for passkey to appear, then return response
-                while time.time() - start_time < 15:
-                    # Check if process has output
-                    if process.poll() is not None:
-                        # Process finished
-                        remaining = process.stdout.read()
-                        if remaining:
-                            output_lines.append(remaining)
-                        break
-
-                    try:
-                        line = process.stdout.readline()
-                        if line:
-                            output_lines.append(line)
-                            self.logger.info(f"BT pair output: {line.strip()}")
-
-                            # Check for passkey
-                            match = re.search(r'PASSKEY_REQUIRED:(\d+)', line)
-                            if match:
-                                passkey = match.group(1)
-                                self.logger.info(f"Found passkey: {passkey}")
-                                # Return immediately with passkey, let process continue in background
-                                return jsonify({
-                                    'success': True,
-                                    'status': 'passkey_required',
-                                    'passkey': passkey,
-                                    'message': f"Type {passkey} on the keyboard and press Enter"
-                                })
-                    except Exception as e:
-                        self.logger.warning(f"Error reading BT output: {e}")
-                        break
-
-                    time.sleep(0.1)
-
-                # Check final output
-                full_output = ''.join(output_lines)
-                self.logger.info(f"BT pair full output: {full_output[:500]}")
-
-                # Check for explicit failure messages
-                if 'PAIRING_FAILED' in full_output or 'Failed to pair' in full_output:
-                    error_msg = 'Pairing failed. Make sure the keyboard is in pairing mode (hold power button until light blinks).'
-                    if 'ConnectionAttemptFailed' in full_output:
-                        error_msg = 'Could not connect to keyboard. Press the power button to wake it up, then try again immediately.'
-                    elif 'not available' in full_output.lower():
-                        error_msg = 'Device not found. Make sure Bluetooth is scanning and the keyboard is discoverable.'
-                    return jsonify({'success': False, 'error': error_msg}), 200
-
-                if 'DEVICE_NOT_AVAILABLE' in full_output:
-                    return jsonify({
-                        'success': False,
-                        'error': 'Device not found. Run a new scan and try pairing again while the keyboard light is blinking.'
-                    }), 200
-
-                if 'PAIRING_TIMEOUT' in full_output:
-                    return jsonify({
-                        'success': False,
-                        'error': 'Pairing timed out. Wake up the keyboard and try again.'
-                    }), 200
-
-                # Check if pairing succeeded
-                if 'PAIRING_SUCCESS' in full_output or 'Pairing successful' in full_output:
-                    return jsonify({'success': True, 'status': 'paired'})
-
-                # If we got here without passkey, check if process is still running
-                if process.poll() is None:
-                    # Process still running, might be waiting for passkey
-                    # Return a message to try manual PIN entry
-                    return jsonify({
-                        'success': False,
-                        'error': 'Pairing initiated but no passkey detected. Try manual PIN entry (0000 or 1234).'
-                    }), 200
-
-                # Default - check for any success indicator
-                if 'successful' in full_output.lower():
-                    return jsonify({'success': True, 'status': 'paired'})
-
-                return jsonify({
-                    'success': False,
-                    'error': 'Pairing result unknown. Check if the device appears in paired devices list.'
-                }), 200
-            except subprocess.TimeoutExpired:
-                return jsonify({'error': 'Pairing timed out'}), 500
-            except Exception as e:
-                self.logger.error(f"Bluetooth pairing failed: {e}")
-                return jsonify({'error': str(e)}), 500
-
-        @self.flask_app.route('/api/bluetooth/remove', methods=['POST'])
-        def bluetooth_remove():
-            """Remove a paired Bluetooth device"""
-            try:
-                import subprocess
-                data = request.get_json()
-                mac = data.get('mac')
-                
-                if not mac:
-                    return jsonify({'error': 'MAC address required'}), 400
-                
-                result = subprocess.run(['sudo', '/home/pi/PiBook/scripts/bluetooth_helper.sh', 'remove', mac], 
-                                      capture_output=True, text=True, timeout=10)
-                
-                if result.returncode == 0:
-                    return jsonify({'success': True})
-                else:
-                    return jsonify({'error': result.stderr}), 500
-            except Exception as e:
-                self.logger.error(f"Bluetooth device removal failed: {e}")
-                return jsonify({'error': str(e)}), 500
+      
 
         @self.flask_app.route('/api/system_stats')
         def system_stats():
@@ -872,19 +653,6 @@ class PiBookWebServer:
                 except:
                     stats['wifi_status'] = 'Unknown'
 
-                # Bluetooth Status
-                try:
-                    result = subprocess.run(['systemctl', 'is-active', 'bluetooth'], capture_output=True, text=True, timeout=2)
-                    if result.returncode == 0 and result.stdout.strip() == 'active':
-                        hci_result = subprocess.run(['hciconfig', 'hci0'], capture_output=True, text=True, timeout=2)
-                        if hci_result.returncode == 0 and 'UP RUNNING' in hci_result.stdout:
-                            stats['bluetooth_status'] = 'On'
-                        else:
-                            stats['bluetooth_status'] = 'On (No Device)'
-                    else:
-                        stats['bluetooth_status'] = 'Off'
-                except:
-                    stats['bluetooth_status'] = 'Unknown'
 
                 # CPU Voltage
                 try:
@@ -1030,91 +798,7 @@ class PiBookWebServer:
         except:
             return False
 
-    def _get_klipper_info(self, ip: str, hostname: str = '') -> dict:
-        """Get Klipper printer info from Moonraker API"""
-        import urllib.request
-        import json as json_lib
 
-        try:
-            # Get printer info from Moonraker API
-            base_url = f"http://{ip}:7125"
-
-            printer_info = {
-                'ip': ip,
-                'hostname': hostname,
-                'state': 'unknown',
-                'klipper_version': None,
-                'extruder_temp': None,
-                'extruder_target': None,
-                'bed_temp': None,
-                'bed_target': None,
-                'progress': None
-            }
-
-            # Get server info (includes Klipper version)
-            try:
-                req = urllib.request.Request(f"{base_url}/server/info", method='GET')
-                req.add_header('Content-Type', 'application/json')
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    data = json_lib.loads(response.read().decode())
-                    if 'result' in data:
-                        printer_info['klipper_version'] = data['result'].get('klippy_state', 'unknown')
-            except Exception as e:
-                self.logger.debug(f"Failed to get server info from {ip}: {e}")
-
-            # Get printer state
-            try:
-                req = urllib.request.Request(f"{base_url}/printer/info", method='GET')
-                req.add_header('Content-Type', 'application/json')
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    data = json_lib.loads(response.read().decode())
-                    if 'result' in data:
-                        printer_info['state'] = data['result'].get('state', 'unknown')
-            except Exception as e:
-                self.logger.debug(f"Failed to get printer info from {ip}: {e}")
-
-            # Get temperature data
-            try:
-                req = urllib.request.Request(
-                    f"{base_url}/printer/objects/query?extruder&heater_bed&print_stats",
-                    method='GET'
-                )
-                req.add_header('Content-Type', 'application/json')
-                with urllib.request.urlopen(req, timeout=5) as response:
-                    data = json_lib.loads(response.read().decode())
-                    if 'result' in data and 'status' in data['result']:
-                        status = data['result']['status']
-
-                        # Extruder temps
-                        if 'extruder' in status:
-                            printer_info['extruder_temp'] = status['extruder'].get('temperature', 0)
-                            printer_info['extruder_target'] = status['extruder'].get('target', 0)
-
-                        # Bed temps
-                        if 'heater_bed' in status:
-                            printer_info['bed_temp'] = status['heater_bed'].get('temperature', 0)
-                            printer_info['bed_target'] = status['heater_bed'].get('target', 0)
-
-                        # Print progress
-                        if 'print_stats' in status:
-                            print_stats = status['print_stats']
-                            state = print_stats.get('state', '')
-                            if state == 'printing':
-                                printer_info['state'] = 'printing'
-                                printer_info['progress'] = print_stats.get('progress', 0)
-                            elif state == 'complete':
-                                printer_info['state'] = 'complete'
-                            elif state == 'standby':
-                                printer_info['state'] = 'ready'
-
-            except Exception as e:
-                self.logger.debug(f"Failed to get temperature data from {ip}: {e}")
-
-            return printer_info
-
-        except Exception as e:
-            self.logger.error(f"Failed to get Klipper info from {ip}: {e}")
-            return None
 
     def _get_books(self):
         """Get list of EPUB files"""

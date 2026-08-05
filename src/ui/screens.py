@@ -39,21 +39,7 @@ def get_wifi_status():
         return False
 
 
-def get_bluetooth_status():
-    """Check if Bluetooth is enabled"""
-    try:
-        # Check if bluetooth service is active
-        result = subprocess.run(['systemctl', 'is-active', 'bluetooth'],
-                              capture_output=True, text=True, timeout=2)
-        if result.returncode == 0 and result.stdout.strip() == 'active':
-            # Also check if hci0 is up
-            hci_result = subprocess.run(['hciconfig', 'hci0'],
-                                      capture_output=True, text=True, timeout=2)
-            if hci_result.returncode == 0 and 'UP RUNNING' in hci_result.stdout:
-                return True
-        return False
-    except Exception:
-        return False
+
 
 
 class MainMenuScreen:
@@ -104,30 +90,7 @@ class MainMenuScreen:
                 'description': 'Read EPUB books',
                 'screen': 'library'
             },
-            {
-                'name': 'IP Scanner',
-                'icon_filename': 'ip_scanner.png',
-                'description': 'Scan network devices',
-                'screen': 'ip_scanner'
-            },
-            {
-                'name': 'To Do',
-                'icon_filename': 'todo.png',
-                'description': 'Manage tasks',
-                'screen': 'todo'
-            },
-            {
-                'name': 'Klipper',
-                'icon_filename': 'klipper.png',
-                'description': 'Monitor 3D printers',
-                'screen': 'klipper'
-            },
-            {
-                'name': 'Terminal',
-                'icon_filename': 'terminal.png',
-                'description': 'Terminal console',
-                'screen': 'typewriter'
-            },
+
             {
                 'name': 'Shutdown',
                 'icon_filename': 'shutdown.png',

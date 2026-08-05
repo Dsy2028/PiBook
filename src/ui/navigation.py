@@ -13,10 +13,7 @@ class Screen(Enum):
     MAIN_MENU = "main_menu"
     LIBRARY = "library"
     READER = "reader"
-    IP_SCANNER = "ip_scanner"
-    TODO = "todo"
-    KLIPPER = "klipper"
-    TYPEWRITER = "typewriter"
+
 
 
 class NavigationManager:

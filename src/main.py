@@ -24,10 +24,7 @@ from src.hardware.gpio_handler import GPIOHandler
 from src.hardware.battery_monitor import BatteryMonitor
 from src.ui.navigation import NavigationManager, Screen
 from src.ui.screens import MainMenuScreen, LibraryScreen, ReaderScreen
-from src.apps.todo import ToDoScreen
-from src.apps.ipscanner import IPScannerScreen
-from src.apps.klipper import KlipperScreen
-from src.apps.typewriter import TypewriterScreen
+
 from src.web.webserver import PiBookWebServer
 from src.utils.progress_manager import ProgressManager
 from src.core.power_manager import PowerManager
@@ -113,19 +110,6 @@ class PiBookApp:
                 self.logger.warning(f"Failed to initialize PiSugar button handler: {e}")
                 self.pisugar_button = None
 
-        # Initialize Bluetooth keyboard handler
-        self.keyboard_handler = None
-        if self.config.get('keyboard.enabled', True):
-            try:
-                from src.hardware.keyboard_handler import KeyboardHandler
-                self.keyboard_handler = KeyboardHandler(
-                    device_pattern=self.config.get('keyboard.device_pattern', None),
-                    logger=self.logger
-                )
-                self.logger.info("Bluetooth keyboard handler initialized")
-            except Exception as e:
-                self.logger.warning(f"Failed to initialize keyboard handler: {e}")
-                self.keyboard_handler = None
 
         # Initialize reading progress manager
         progress_file = self.config.get('reading_progress.progress_file', 'data/reading_progress.json')
@@ -172,33 +156,7 @@ class PiBookApp:
             battery_monitor=self.battery_monitor
         )
 
-        self.ip_scanner_screen = IPScannerScreen(
-            width=display_width,
-            height=display_height,
-            font_size=self.config.get('ip_scanner.font_size', 18),
-            battery_monitor=self.battery_monitor
-        )
-
-        self.todo_screen = ToDoScreen(
-            width=display_width,
-            height=display_height,
-            font_size=self.config.get('todo.font_size', 18),
-            battery_monitor=self.battery_monitor
-        )
-
-        self.klipper_screen = KlipperScreen(
-            width=display_width,
-            height=display_height,
-            font_size=self.config.get('klipper.font_size', 18),
-            battery_monitor=self.battery_monitor
-        )
-
-        self.typewriter_screen = TypewriterScreen(
-            width=display_width,
-            height=display_height,
-            font_size=self.config.get('typewriter.font_size', 16),
-            battery_monitor=self.battery_monitor
-        )
+        
 
         # Initialize power manager
         self.power_manager = PowerManager(self.config, self.display, self.logger)
